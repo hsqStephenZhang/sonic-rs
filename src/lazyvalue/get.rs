@@ -672,4 +672,32 @@ mod test {
             assert!(many[7].is_none())
         }
     }
+
+    #[test]
+    fn test_get_many_missing_in_empty_object() {
+        // Case: empty object with missing key should yield None, not Err
+        let json = Bytes::from(r#"{"a": {}, "b": {"c": "foo"}}"#);
+        let mut tree = PointerTree::new();
+        tree.add_path(pointer!["a", "c"].iter());
+
+        let nodes = get_many(&json, &tree).unwrap();
+        assert!(nodes[0].is_none());
+    }
+
+    #[test]
+    fn test_get_many_array_oob_and_invalid_paths() {
+        // Out-of-bounds array index and invalid paths should not fail entire query
+        let json = Bytes::from(r#"{"a": [1, 2], "b": {"c": "found"}, "d": {}}"#);
+        let mut tree = PointerTree::new();
+        tree.add_path(pointer!["a", 99].iter()); // out of bounds
+        tree.add_path(pointer!["b", "c"].iter()); // valid path
+        tree.add_path(pointer!["b", "d"].iter()); // invalid path
+        tree.add_path(pointer!["d", "e"].iter()); // invalid path
+
+        let nodes = get_many(&json, &tree).unwrap();
+        assert!(nodes[0].is_none());
+        assert_eq!(nodes[1].as_ref().unwrap().as_raw_str(), "\"found\"");
+        assert!(nodes[2].is_none());
+        assert!(nodes[3].is_none());
+    }
 }

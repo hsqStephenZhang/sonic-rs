@@ -1892,7 +1892,12 @@ where
         // deal with the empty object
         match self.get_next_token([b'"', b'}'], 1) {
             Some(b'"') => {}
-            Some(b'}') => return perr!(self, GetInEmptyObject),
+            Some(b'}') => {
+                // empty object: consume '}' and return Ok without error,
+                // leaving unmatched paths as None
+                self.read.eat(1);
+                return Ok(());
+            }
             None => return perr!(self, EofWhileParsing),
             Some(_) => unreachable!(),
         }
@@ -1946,7 +1951,7 @@ where
         // deal with the empty object
         match self.skip_space() {
             Some(b'"') => {}
-            Some(b'}') => return perr!(self, GetInEmptyObject),
+            Some(b'}') => return Ok(()),
             _ => {
                 return perr!(self, ExpectObjectKeyOrEnd);
             }
@@ -2007,7 +2012,12 @@ where
         let mut visited = 0;
 
         match self.skip_space_peek() {
-            Some(b']') => return perr!(self, GetInEmptyArray),
+            Some(b']') => {
+                // empty array: consume ']' and return Ok,
+                // unmatched indices remain None
+                self.read.eat(1);
+                return Ok(());
+            }
             None => return perr!(self, EofWhileParsing),
             _ => {}
         };
@@ -2043,11 +2053,8 @@ where
         }
 
         // check whether remaining unknown keys
-        if visited < midx.len() {
-            perr!(self, GetIndexOutOfArray)
-        } else {
-            Ok(())
-        }
+        // Do not error on missing indices; leave them as None
+        Ok(())
     }
 
     fn get_many_index(
@@ -2067,7 +2074,11 @@ where
 
         // check empty array
         match self.skip_space_peek() {
-            Some(b']') => return perr!(self, GetInEmptyArray),
+            Some(b']') => {
+                // empty array: consume ']' and return Ok
+                self.read.eat(1);
+                return Ok(());
+            }
             Some(_) => {}
             None => return perr!(self, EofWhileParsing),
         }
@@ -2095,11 +2106,8 @@ where
         }
 
         // check whether remaining unknown keys
-        if visited < midx.len() {
-            perr!(self, GetIndexOutOfArray)
-        } else {
-            Ok(())
-        }
+        // Do not error on missing indices; leave them as None
+        Ok(())
     }
 
     pub(crate) fn get_many(
