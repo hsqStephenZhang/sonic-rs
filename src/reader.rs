@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, pin::Pin, ptr::NonNull};
+use std::{fmt::UpperExp, marker::PhantomData, pin::Pin, ptr::NonNull};
 
 use faststr::FastStr;
 
@@ -76,6 +76,24 @@ pub trait Reader<'de>: Sealed {
         self.as_u8_slice()
     }
 }
+
+pub trait ReaderExt<'de>: Reader<'de> {
+    /// bump one u8 if `f(ch)` holds
+    /// return if the u8 is bumped
+    #[inline(always)]
+    fn eat_if(&mut self, f: impl FnOnce(u8) -> bool) -> bool {
+        if let Some(ch) = self.peek() {
+            if f(ch) {
+                self.eat(1);
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+impl<'de, T> ReaderExt<'de> for T where T: Reader<'de> {}
 
 enum PinnedInput<'a> {
     FastStr(Pin<Box<FastStr>>),

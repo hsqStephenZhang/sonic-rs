@@ -31,6 +31,8 @@ serde_derive  = "1.0"
 serde_json    = { version = "1.0", features = ["float_roundtrip", "raw_value"] }
 simd-json     = "0.17"
 sonic-rs      = { path = "../" }
+rand          = "0.8"
+sonic-simd    = { path = "../sonic-simd" }
 # This schema are used in benches and copied from https://github.com/serde-rs/json-benchmark
 bytes       = { version = "1.10", features = ["serde"] }
 chrono      = { version = "0.4", features = ["serde"] }
@@ -61,6 +63,10 @@ name    = "get_from"
 [[bench]]
 harness = false
 name    = "value_operator"
+
+[[bench]]
+harness = false
+name    = "skipper"
 
 [features]
 default = []
