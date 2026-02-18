@@ -1113,6 +1113,7 @@ where
         perr!(self, EofWhileParsing)
     }
 
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sve2")))]
     #[inline(always)]
     fn get_next_token<const N: usize>(&mut self, tokens: [u8; N], advance: usize) -> Option<u8> {
         let r = &mut self.read;
@@ -1126,6 +1127,43 @@ where
             let next = vor.bitmask();
             if next != 0 {
                 let cnt = next.trailing_zeros() as usize;
+                let ch = chunk[cnt];
+                r.eat(cnt + advance);
+                return Some(ch);
+            }
+            r.eat(LANS);
+        }
+
+        while let Some(ch) = r.peek() {
+            for t in tokens.iter().take(N) {
+                if ch == *t {
+                    r.eat(advance);
+                    return Some(ch);
+                }
+            }
+            r.eat(1)
+        }
+        None
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+    #[inline(always)]
+    fn get_next_token<const N: usize>(&mut self, tokens: [u8; N], advance: usize) -> Option<u8> {
+        let r = &mut self.read;
+        const LANS: usize = 16;
+        while let Some(chunk) = r.peek_n(LANS) {
+            use crate::util::arch::{get_next_token1, get_next_token2, get_next_token3};
+
+            let chunk = unsafe { &*(chunk.as_ptr() as *const [_; 16]) };
+            let cnt = unsafe {
+                match N {
+                    1 => get_next_token1(chunk, tokens[0]),
+                    2 => get_next_token2(chunk, tokens[0], tokens[1]),
+                    3 => get_next_token3(chunk, tokens[0], tokens[1], tokens[2]),
+                    _ => core::hint::unreachable_unchecked(),
+                }
+            };
+            if cnt != 16 {
                 let ch = chunk[cnt];
                 r.eat(cnt + advance);
                 return Some(ch);
