@@ -1489,8 +1489,8 @@ where
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+    #[inline(always)]
     pub(crate) fn do_skip_number(&mut self, mut first: u8) -> Result<()> {
-        // check eof after the sign
         if first == b'-' {
             first = self.skip_single_digit()?;
         }
@@ -1519,77 +1519,65 @@ where
 
         // SIMD path for long number
         const LANES: usize = 16;
-        while let Some(chunk) = self.read.peek_n(LANES) {
-            let chunk = unsafe { &*(chunk.as_ptr() as *const _ as *const [u8; LANES]) };
-            let (idx1, idx2) = unsafe { crate::util::arch::skip_digit_sve2_pair(chunk) };
-            if idx1 != 16 {
-                let ch = chunk[idx1];
+        while let Some(chunk_slice) = self.read.peek_n(LANES) {
+            // 将 slice 转换为固定大小的 array 引用，这是给 asm 函数使用的
+            let chunk = unsafe { &*(chunk_slice.as_ptr() as *const [u8; LANES]) };
+
+            // 【Step 1】: 执行极速热路径查找
+            let mut cnt = unsafe { crate::util::arch::skip_digit_sve2_first(chunk) };
+
+            if cnt < LANES {
+                let ch = chunk[cnt];
+
                 if ch == b'.' && !is_float {
-                    self.read.eat(idx1 + 1);
-                    // check the first digit after the dot
+                    self.read.eat(cnt + 1);
+                    // 验证并吃掉小数点后的第一位数字
                     self.skip_single_digit()?;
 
-                    // check the overflow
-                    if idx1 + 2 >= LANES {
+                    // 更新当前逻辑处理到的索引位置
+                    cnt += 2;
+                    if cnt >= LANES {
                         is_float = true;
-                        continue;
+                        continue; // 跨 chunk 的情况，进入下一轮
                     }
 
-                    if idx2 != 16 {
-                        let ch = chunk[idx2];
-                        if ch == b'e' || ch == b'E' {
-                            self.read.eat(idx2 - idx1 - 1);
+                    // 【Step 2】: 触发浮点数冷路径
+                    // 我们想从 `cnt` 处开始找，所以要忽略 `0..= (cnt - 1)` 的结果
+                    let next_idx = unsafe { crate::util::arch::skip_digit_sve2_next(chunk, cnt - 1) };
+
+                    if next_idx < LANES {
+                        let ch2 = chunk[next_idx];
+                        let offset = next_idx - cnt; // 计算与当前读取指针的相对距离
+
+                        if ch2 == b'e' || ch2 == b'E' {
+                            self.read.eat(offset + 1);
                             return self.skip_exponent();
                         } else {
-                            self.read.eat(idx2 - idx1 - 2);
+                            self.read.eat(offset); // 停在非数字分隔符前
                             return Ok(());
                         }
                     } else {
-                        self.read.eat(LANES - idx1 - 2);
+                        // 这个 chunk 剩下的全都是数字了
+                        self.read.eat(LANES - cnt);
                         is_float = true;
                         continue;
                     }
                 } else if ch == b'e' || ch == b'E' {
-                    self.read.eat(idx1 + 1);
+                    self.read.eat(cnt + 1);
                     return self.skip_exponent();
                 } else {
-                    self.read.eat(idx1);
+                    // 正常的数字结束 (遇到 ',', '}' 等)
+                    self.read.eat(cnt);
                     return Ok(());
                 }
             }
-            // long digits
-            self.read.eat(16);
+
+            // 全是数字，跳过整个 16 字节
+            self.read.eat(LANES);
         }
 
-        // has less than 16 bytes
-        while matches!(self.read.peek(), Some(b'0'..=b'9')) {
-            self.read.eat(1);
-        }
-
-        match self.read.peek() {
-            Some(b'.') if !is_float => {
-                self.read.eat(1);
-                self.skip_single_digit()?;
-                while matches!(self.read.peek(), Some(b'0'..=b'9')) {
-                    self.read.eat(1);
-                }
-                match self.read.peek() {
-                    Some(b'e' | b'E') => {
-                        self.read.eat(1);
-                        return self.skip_exponent();
-                    }
-                    _ => return Ok(()),
-                }
-            }
-            Some(b'e' | b'E') => {
-                self.read.eat(1);
-                return self.skip_exponent();
-            }
-            _ => {}
-        }
         Ok(())
     }
-
     #[inline(always)]
     pub fn skip_one(&mut self) -> Result<(&'de [u8], ParseStatus)> {
         let ch = self.skip_space();

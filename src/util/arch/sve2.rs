@@ -46,63 +46,83 @@ pub unsafe fn get_nonspace_index(data: &[u8; 16]) -> usize {
     idx as usize
 }
 
-#[inline(always)]
-pub unsafe fn skip_digit_sve2_pair(data: &[u8; 16]) -> (usize, usize) {
-    let mut first: u64;
-    let mut second: u64;
+use core::arch::asm;
 
+/// 寻找 16 字节块中的第一个非数字字符的位置。
+/// 如果全是数字，返回 16。
+#[inline(always)]
+pub unsafe fn skip_digit_sve2_first(data: &[u8; 16]) -> usize {
+    let mut first: u64;
     let start: u32 = b'0' as u32;
     let range: u32 = 9;
 
-    core::arch::asm!(
+    asm!(
         "ptrue  p0.b, vl16",
         "ld1b   z0.b, p0/z, [{ptr}]",
 
         "mov    z1.b, {start:w}",
         "mov    z2.b, {range:w}",
 
-        // 1. identify all non-digits
+        // 识别非数字
         "sub    z0.b, z0.b, z1.b",
         "cmphi  p1.b, p0/z, z0.b, z2.b",
 
-        // 2. first non-digit
+        // 寻找第一个非数字的位置
         "brkb   p2.b, p0/z, p1.b",
         "cntp   {first}, p0, p2.b",
-
-        // 3. mask out first non-digit
-        "brka   p3.b, p0/z, p1.b",
-        "bic    p4.b, p0/z, p1.b, p3.b",
-
-        // 4. second non-digit
-        "brkb   p5.b, p0/z, p4.b",
-        "cntp   {second}, p0, p5.b",
 
         ptr = in(reg) data.as_ptr(),
         start = in(reg) start,
         range = in(reg) range,
         first = out(reg) first,
-        second = out(reg) second,
 
-        out("z0") _,
-        out("z1") _,
-        out("z2") _,
-        out("p0") _,
-        out("p1") _,
-        out("p2") _,
-        out("p3") _,
-        out("p4") _,
-        out("p5") _,
+        out("z0") _, out("z1") _, out("z2") _,
+        out("p0") _, out("p1") _, out("p2") _,
     );
 
-    (first as usize, second as usize)
+    first as usize
 }
 
-#[test]
-fn test_skip_digit_sve2_pair() {
-    let mut s = [0u8; 16];
-    let dst = b"12.34e5";
-    s[..dst.len()].copy_from_slice(&dst[..]);
-    let (idx1, idx2) = unsafe { skip_digit_sve2_pair(&s) };
-    assert_eq!(idx1, 2); // '.' at index 2
-    assert_eq!(idx2, 5); // 'e' at index 5
+/// 在 16 字节块中，忽略 `0..=skip_up_to` 的字符，寻找下一个非数字的位置。
+/// 如果剩下的全是数字，返回 16。
+#[inline(always)]
+pub unsafe fn skip_digit_sve2_next(data: &[u8; 16], skip_up_to: usize) -> usize {
+    let mut next_idx: u64;
+    let start: u32 = b'0' as u32;
+    let range: u32 = 9;
+    let zero: u64 = 0;
+    let skip_bound = skip_up_to as u64;
+
+    asm!(
+        "ptrue  p0.b, vl16",
+        "ld1b   z0.b, p0/z, [{ptr}]",
+
+        "mov    z1.b, {start:w}",
+        "mov    z2.b, {range:w}",
+
+        // 重新识别非数字
+        "sub    z0.b, z0.b, z1.b",
+        "cmphi  p1.b, p0/z, z0.b, z2.b",
+
+        // 核心复用逻辑：生成忽略掩码 (lane_idx <= skip_bound)
+        "whilels p3.b, {zero}, {skip_bound}",
+        // 从 p1 中清除掉要忽略的前缀
+        "bic    p1.b, p0/z, p1.b, p3.b",
+
+        // 在剩余部分寻找第一个非数字
+        "brkb   p2.b, p0/z, p1.b",
+        "cntp   {next_idx}, p0, p2.b",
+
+        ptr = in(reg) data.as_ptr(),
+        start = in(reg) start,
+        range = in(reg) range,
+        zero = in(reg) zero,
+        skip_bound = in(reg) skip_bound,
+        next_idx = out(reg) next_idx,
+
+        out("z0") _, out("z1") _, out("z2") _,
+        out("p0") _, out("p1") _, out("p2") _, out("p3") _,
+    );
+
+    next_idx as usize
 }
