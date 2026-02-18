@@ -1380,6 +1380,7 @@ where
     }
 
     #[inline(always)]
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sve2")))]
     pub(crate) fn do_skip_number(&mut self, mut first: u8) -> Result<()> {
         // check eof after the sign
         if first == b'-' {
@@ -1459,6 +1460,108 @@ where
         }
 
         // has less than 32 bytes
+        while matches!(self.read.peek(), Some(b'0'..=b'9')) {
+            self.read.eat(1);
+        }
+
+        match self.read.peek() {
+            Some(b'.') if !is_float => {
+                self.read.eat(1);
+                self.skip_single_digit()?;
+                while matches!(self.read.peek(), Some(b'0'..=b'9')) {
+                    self.read.eat(1);
+                }
+                match self.read.peek() {
+                    Some(b'e' | b'E') => {
+                        self.read.eat(1);
+                        return self.skip_exponent();
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            Some(b'e' | b'E') => {
+                self.read.eat(1);
+                return self.skip_exponent();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
+    pub(crate) fn do_skip_number(&mut self, mut first: u8) -> Result<()> {
+        // check eof after the sign
+        if first == b'-' {
+            first = self.skip_single_digit()?;
+        }
+
+        // check the leading zeros
+        let second = self.read.peek();
+        if first == b'0' && matches!(second, Some(b'0'..=b'9')) {
+            return perr!(self, InvalidNumber);
+        }
+
+        // fast path for the single digit
+        let mut is_float: bool = false;
+        match second {
+            Some(b'0'..=b'9') => self.read.eat(1),
+            Some(b'.') => {
+                is_float = true;
+                self.read.eat(1);
+                self.skip_single_digit()?;
+            }
+            Some(b'e' | b'E') => {
+                self.read.eat(1);
+                return self.skip_exponent();
+            }
+            _ => return Ok(()),
+        }
+
+        // SIMD path for long number
+        const LANES: usize = 16;
+        while let Some(chunk) = self.read.peek_n(LANES) {
+            let chunk = unsafe { &*(chunk.as_ptr() as *const _ as *const [u8; LANES]) };
+            let (idx1, idx2) = unsafe { crate::util::arch::skip_digit_sve2_pair(chunk) };
+            if idx1 != 16 {
+                let ch = chunk[idx1];
+                if ch == b'.' && !is_float {
+                    self.read.eat(idx1 + 1);
+                    // check the first digit after the dot
+                    self.skip_single_digit()?;
+
+                    // check the overflow
+                    if idx1 + 2 >= LANES {
+                        is_float = true;
+                        continue;
+                    }
+
+                    if idx2 != 16 {
+                        let ch = chunk[idx2];
+                        if ch == b'e' || ch == b'E' {
+                            self.read.eat(idx2 - idx1 - 1);
+                            return self.skip_exponent();
+                        } else {
+                            self.read.eat(idx2 - idx1 - 2);
+                            return Ok(());
+                        }
+                    } else {
+                        self.read.eat(LANES - idx1 - 2);
+                        is_float = true;
+                        continue;
+                    }
+                } else if ch == b'e' || ch == b'E' {
+                    self.read.eat(idx1 + 1);
+                    return self.skip_exponent();
+                } else {
+                    self.read.eat(idx1);
+                    return Ok(());
+                }
+            }
+            // long digits
+            self.read.eat(16);
+        }
+
+        // has less than 16 bytes
         while matches!(self.read.peek(), Some(b'0'..=b'9')) {
             self.read.eat(1);
         }
