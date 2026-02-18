@@ -77,26 +77,30 @@ pub unsafe fn get_next_token1(data: &[u8; 16], tk: u8) -> usize {
 
 pub unsafe fn get_next_token2(data: &[u8; 16], tk1: u8, tk2: u8) -> usize {
     let mut idx: u64 = 16;
-    // 将两个 token 填入 32 位寄存器（高低各复制一份，match 会扫描 z1 所有字节）
-    let token = (tk1 as u32) | ((tk2 as u32) << 8) | ((tk1 as u32) << 16) | ((tk2 as u32) << 24);
+    let (t1, t2) = (tk1 as u32, tk2 as u32);
 
     core::arch::asm!(
         "ptrue  p0.b, vl16",
         "ld1b   {{z0.b}}, p0/z, [{ptr}]",
-        "mov    z1.s, {t:w}",
+        "dup    z1.b, {t1:w}",
+        "dup    z2.b, {t2:w}",
 
-        "match  p1.b, p0/z, z0.b, z1.b", // 一条指令匹配两个 token
+        "cmpeq  p1.b, p0/z, z0.b, z1.b",
+        "cmpeq  p2.b, p0/z, z0.b, z2.b",
+        "orr    p3.b, p0/z, p1.b, p2.b",
+
         "b.none 1f",
 
-        "brkb   p2.b, p0/z, p1.b",
-        "cntp   {idx}, p0, p2.b",
+        "brkb   p4.b, p0/z, p3.b",
+        "cntp   {idx}, p0, p4.b",
 
         "1:",
         ptr = in(reg) data.as_ptr(),
-        t   = in(reg) token,
+        t1  = in(reg) t1,
+        t2  = in(reg) t2,
         idx = inout(reg) idx,
-        out("z0") _, out("z1") _,
-        out("p0") _, out("p1") _, out("p2") _,
+        out("z0") _, out("z1") _, out("z2") _,
+        out("p0") _, out("p1") _, out("p2") _, out("p3") _, out("p4") _,
     );
 
     idx as usize
