@@ -39,6 +39,7 @@ schema      = { path = "benches/schema" }
 serde_bytes = "0.11"
 atoi_simd = "0.18.1"
 sonic-number = { path = "../sonic-number" }
+rand = "0.10"
 
 [[bench]]
 harness = false

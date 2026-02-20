@@ -79,27 +79,9 @@ macro_rules! simd_add_9_15 {
     }};
 }
 
-// 4096 is a conservative page size
-// which should work for most platforms
 #[inline(always)]
-fn is_page_safe(ptr: *const u8) -> bool {
-    // we use 128bit load, which is 16 bytes
-    ((ptr as usize) & 0xFFF) <= (4096 - 16)
-}
-
-#[inline(always)]
-pub unsafe fn simd_str2int(c: &[u8], need: usize) -> (u64, usize) {
+pub unsafe fn simd_str2int_vertical_vext(c: &[u8], need: usize) -> (u64, usize) {
     debug_assert!(need <= 16);
-
-    if !is_page_safe(c.as_ptr()) {
-        let mut sum = 0u64;
-        let mut i = 0;
-        while i < need && c.get_unchecked(i).is_ascii_digit() {
-            sum = (c.get_unchecked(i) - b'0') as u64 + sum * 10;
-            i += 1;
-        }
-        return (sum, i);
-    }
 
     let data = vld1q_u8(c.as_ptr());
     let zero_char = vdupq_n_u8(b'0');
@@ -152,4 +134,168 @@ pub unsafe fn simd_str2int(c: &[u8], need: usize) -> (u64, usize) {
     };
 
     (sum, count)
+}
+
+#[repr(C, align(16))]
+struct ShuffleTable([u8; 16 * 17]);
+
+const NEON_SHUFFLE_TABLE: ShuffleTable = ShuffleTable([
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, // 0
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, // 1
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, // 2
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, // 3
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, // 4
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, // 5
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, // 6
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, // 7
+    255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, // 8
+    255, 255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, // 9
+    255, 255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, // 10
+    255, 255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, // 11
+    255, 255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, // 12
+    255, 255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // 13
+    255, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, // 14
+    255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, // 15
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, // 16
+]);
+
+#[inline(always)]
+pub unsafe fn simd_str2int(c: &[u8], need: usize) -> (u64, usize) {
+    simd_str2int_pairwise(c, need)
+}
+
+/// vertical addition which might be slower than pairwise addition on neon
+#[inline(always)]
+pub unsafe fn simd_str2int_vertical(c: &[u8], need: usize) -> (u64, usize) {
+    debug_assert!(need <= 16);
+
+    let data = vld1q_u8(c.as_ptr());
+    let digits = vsubq_u8(data, vdupq_n_u8(b'0'));
+
+    // shift and shrink to get the mask
+    let gt_nine = vcgtq_u8(digits, vdupq_n_u8(9));
+    let mask16 = vreinterpretq_u16_u8(gt_nine);
+    let mask8 = vshrn_n_u16::<4>(mask16);
+    let mask64 = vget_lane_u64::<0>(vreinterpret_u64_u8(mask8));
+
+    let first_non_digit = if mask64 == 0 {
+        16
+    } else {
+        (mask64.trailing_zeros() >> 2) as usize
+    };
+    let count = if first_non_digit < need {
+        first_non_digit
+    } else {
+        need
+    };
+
+    // 2. align to the right using vqtbl1q_u8, which is a 16-lane shuffle. we prepare a shuffle
+    //    table to shuffle the digits
+    let shuffle_indices = vld1q_u8(NEON_SHUFFLE_TABLE.0.as_ptr().add(count * 16));
+    let aligned = vqtbl1q_u8(digits, shuffle_indices);
+
+    // 3. Tree Reduction
+    let even8 = vget_low_u8(vuzp1q_u8(aligned, aligned));
+    let odd8 = vget_low_u8(vuzp2q_u8(aligned, aligned));
+    let res_u16 = vaddw_u8(vmull_u8(even8, vdup_n_u8(10)), odd8);
+
+    let even16 = vget_low_u16(vuzp1q_u16(res_u16, res_u16));
+    let odd16 = vget_low_u16(vuzp2q_u16(res_u16, res_u16));
+    let res_u32 = vaddw_u16(vmull_n_u16(even16, 100), odd16);
+
+    let even32 = vget_low_u32(vuzp1q_u32(res_u32, res_u32));
+    let odd32 = vget_low_u32(vuzp2q_u32(res_u32, res_u32));
+    let res_u64 = vaddw_u32(vmull_n_u32(even32, 10000), odd32);
+
+    let high = vgetq_lane_u64::<0>(res_u64);
+    let low = vgetq_lane_u64::<1>(res_u64);
+
+    let sum = low + high * 100_000_000;
+
+    (sum, count)
+}
+
+/// horizontal addition
+#[inline(always)]
+pub unsafe fn simd_str2int_pairwise(c: &[u8], need: usize) -> (u64, usize) {
+    debug_assert!(need <= 16);
+
+    let data = vld1q_u8(c.as_ptr());
+    let digits = vsubq_u8(data, vdupq_n_u8(b'0'));
+
+    let gt_nine = vcgtq_u8(digits, vdupq_n_u8(9));
+    let mask16 = vreinterpretq_u16_u8(gt_nine);
+    let mask8 = vshrn_n_u16::<4>(mask16);
+    let mask64 = vget_lane_u64::<0>(vreinterpret_u64_u8(mask8));
+
+    let first_non_digit = if mask64 == 0 {
+        16
+    } else {
+        (mask64.trailing_zeros() >> 2) as usize
+    };
+    let count = if first_non_digit < need {
+        first_non_digit
+    } else {
+        need
+    };
+
+    // 3. align to the right
+    let shuffle_indices = vld1q_u8(NEON_SHUFFLE_TABLE.0.as_ptr().add(count * 16));
+    let aligned = vqtbl1q_u8(digits, shuffle_indices);
+
+    // 4. tree reduction using pairwise addition
+    // there is no overflow risk because the max sum of 8 digits is 10 * 9 = 90 < 255
+    let w1 = vld1q_u8([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1].as_ptr());
+    let m1 = vmulq_u8(aligned, w1);
+    let res_u16 = vpaddlq_u8(m1);
+
+    let w2 = vld1q_u16([100, 1, 100, 1, 100, 1, 100, 1].as_ptr());
+    let m2 = vmulq_u16(res_u16, w2);
+    let res_u32 = vpaddlq_u16(m2);
+
+    let w3 = vld1q_u32([10000, 1, 10000, 1].as_ptr());
+    let m3 = vmulq_u32(res_u32, w3);
+    let res_u64 = vpaddlq_u32(m3);
+
+    let high = vgetq_lane_u64::<0>(res_u64);
+    let low = vgetq_lane_u64::<1>(res_u64);
+
+    let sum = low + high * 100_000_000;
+
+    (sum, count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pairwise() {
+        unsafe {
+            let s = b"1234567890123456";
+            let (val, len) = simd_str2int_pairwise(s, 16);
+            assert_eq!(val, 1234567890123456);
+            assert_eq!(len, 16);
+
+            let s2 = b"42abc";
+            let (val, len) = simd_str2int_pairwise(s2, 5);
+            assert_eq!(val, 42);
+            assert_eq!(len, 2);
+        }
+    }
+
+    #[test]
+    fn test_vertical() {
+        unsafe {
+            let s = b"1234567890123456";
+            let (val, len) = simd_str2int(s, 16);
+            assert_eq!(val, 1234567890123456);
+            assert_eq!(len, 16);
+
+            let s2 = b"42abc";
+            let (val, len) = simd_str2int(s2, 5);
+            assert_eq!(val, 42);
+            assert_eq!(len, 2);
+        }
+    }
 }

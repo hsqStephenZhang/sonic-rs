@@ -75,3 +75,12 @@ pub unsafe fn get_nonspace_bits(data: &[u8; 64]) -> u64 {
         chunk_nonspace_bits(vld1q_u8(data.as_ptr().offset(48))),
     )
 }
+
+#[test]
+fn t1() {
+    // let input = b"\t\r\n xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    let mut input = [b'a'; 64];
+    input[0..4].copy_from_slice(&[0x1f, 0x09, 0x20, b'{']);
+    let res = unsafe { get_nonspace_bits(&input) };
+    println!("0x{:x}", res);
+}

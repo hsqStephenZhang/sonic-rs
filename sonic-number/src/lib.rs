@@ -12,7 +12,7 @@ mod slow;
 mod table;
 
 use self::{common::BiasedFp, float::RawFloat, table::POWER_OF_FIVE_128};
-pub use crate::arch::simd_str2int;
+pub use crate::arch::{simd_str2int, simd_str2int_vertical, simd_str2int_vertical_vext, simd_str2int_pairwise};
 
 const FLOATING_LONGEST_DIGITS: usize = 17;
 const F64_BITS: u32 = 64;
