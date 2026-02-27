@@ -1,6 +1,6 @@
 #![allow(warnings)]
 
-use std::hint::black_box;
+use std::{fs::read_dir, hint::black_box};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use sonic_rs::{Read, prelude::Reader};
@@ -190,41 +190,54 @@ impl SveSpaceSkipper {
         while self.skip_space(reader).is_some() {}
     }
 }
-
-// ==========================================
-// Benchmark 代码
-// ==========================================
 fn bench_space_skipper(c: &mut Criterion) {
-    let mut group = c.benchmark_group("SpaceSkipper_Random");
+    let mut group = c.benchmark_group("SpaceSkipper_RealData");
+    
+    // 设置读取目录 (根据你的项目根目录结构调整)
+    let testdata_dir = "benchmarks/benches/testdata";
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // 定义数据规模和空格比例
-    let sizes = [1024, 10 * 1024]; // 测试 1KB 和 10KB 
-    let space_ratios = [0.1, 0.5, 0.9]; // 10% 空格 (紧凑), 50% 空格 (混合), 90% 空格 (稀疏)
-
-    for &size in &sizes {
-        for &ratio in &space_ratios {
-            // 使用固定的 seed 以确保每次 bench 生成的内容完全一致
-            let payload = generate_random_payload(size, ratio, 42);
-            let id = format!("{}B_{}%_spaces", size, (ratio * 100.0) as usize);
-
-            // NEON Benchmark
-            group.bench_with_input(BenchmarkId::new("NEON", &id), &payload, |b, p| {
-                b.iter(|| {
-                    let mut reader = Read::from(p.as_slice());
-                    let mut skipper = NeonSpaceSkipper::new();
-                    black_box(skipper.skip_all_space(&mut reader))
-                });
-            });
-
-            // SVE2 Benchmark
-            group.bench_with_input(BenchmarkId::new("SVE2", &id), &payload, |b, p| {
-                b.iter(|| {
-                    let mut reader = Read::from(p.as_slice());
-                    let mut skipper = SveSpaceSkipper::new();
-                    black_box(skipper.skip_all_space(&mut reader))
-                });
-            });
+    match std::fs::read_dir(testdata_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let file_name = path.file_stem().unwrap().to_string_lossy().to_string();
+                    let content = std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read {:?}", path));
+                    files.push((file_name, content));
+                }
+            }
         }
+        Err(e) => {
+            eprintln!("⚠️ Warning: Failed to read directory '{}': {}. Skipping file-based benchmarks.", testdata_dir, e);
+            return;
+        }
+    }
+
+    if files.is_empty() {
+        eprintln!("⚠️ Warning: No .json files found in '{}'.", testdata_dir);
+        return;
+    }
+
+    // 对每个文件进行 Benchmark
+    for (name, payload) in files {
+        // NEON
+        group.bench_with_input(BenchmarkId::new("NEON", &name), &payload, |b, p| {
+            b.iter(|| {
+                let mut reader = Read::from(p.as_slice());
+                let mut skipper = NeonSpaceSkipper::new();
+                black_box(skipper.skip_all_space(&mut reader))
+            });
+        });
+
+        // SVE2
+        group.bench_with_input(BenchmarkId::new("SVE2", &name), &payload, |b, p| {
+            b.iter(|| {
+                let mut reader = Read::from(p.as_slice());
+                let mut skipper = SveSpaceSkipper::new();
+                black_box(skipper.skip_all_space(&mut reader))
+            });
+        });
     }
 
     group.finish();
