@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -28,7 +30,6 @@ impl NeonSpaceSkipper {
 
     #[inline(always)]
     pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
-        #[inline(always)]
         pub unsafe fn get_nonspace_bits(data: &[u8; 64]) -> u64 {
             use std::arch::aarch64::*;
 
@@ -99,6 +100,11 @@ impl NeonSpaceSkipper {
         }
         None
     }
+
+    #[inline(always)]
+    pub fn skip_all_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) {
+        while self.skip_space(reader).is_some() {}
+    }
 }
 
 // ==========================================
@@ -112,7 +118,6 @@ impl SveSpaceSkipper {
     }
 
     #[inline(always)]
-    // 添加 target_feature 以确保内联汇编在非 SVE2 默认目标下也能编译
     pub unsafe fn skip_space_sve2<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
         #[inline(always)]
         unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u64 {
@@ -158,8 +163,12 @@ impl SveSpaceSkipper {
 
     #[inline(always)]
     pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
-        // Safe wrapper 调度 SVE2
         unsafe { self.skip_space_sve2(reader) }
+    }
+
+    #[inline(always)]
+    pub fn skip_all_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) {
+        while self.skip_space(reader).is_some() {}
     }
 }
 
@@ -183,7 +192,7 @@ fn bench_space_skipper(c: &mut Criterion) {
             b.iter(|| {
                 let mut reader = Read::from(*p);
                 let mut skipper = NeonSpaceSkipper::new();
-                black_box(skipper.skip_space(&mut reader))
+                black_box(skipper.skip_all_space(&mut reader))
             });
         });
 
@@ -192,7 +201,7 @@ fn bench_space_skipper(c: &mut Criterion) {
             b.iter(|| {
                 let mut reader = Read::from(*p);
                 let mut skipper = SveSpaceSkipper::new();
-                black_box(skipper.skip_space(&mut reader))
+                black_box(skipper.skip_all_space(&mut reader))
             });
         });
     }
