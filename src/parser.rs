@@ -275,25 +275,68 @@ impl SpaceSkipper {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
-struct SpaceSkipper;
+struct SpaceSkipper {
+    nospace_bits: u64,
+    nospace_start: isize,
+}
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sve2"))]
 impl SpaceSkipper {
     pub fn new() -> Self {
-        Self
+        Self {
+            nospace_bits: 0,
+            nospace_start: -128,
+        }
     }
 
     #[inline(always)]
-    pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
-        // then we use simd to accelerate skipping space
+    pub unsafe fn skip_space_sve2<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
+        #[inline(always)]
+        unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u64 {
+            let mut pred_buf = [0u8; 32];
+            let tokens: u32 = 0x090a0d20;
+
+            core::arch::asm!(
+                "ptrue  p0.b, vl16",
+                "ld1b   {{z0.b}}, p0/z, [{ptr}]",
+                "mov    z1.s, {t:w}",
+                "nmatch p1.b, p0/z, z0.b, z1.b",
+                "str    p1, [{out_ptr}]",
+                ptr = in(reg) data.as_ptr(),
+                t = in(reg) tokens,
+                out_ptr = in(reg) pred_buf.as_mut_ptr(),
+                out("z0") _, out("z1") _,
+                out("p0") _, out("p1") _,
+            );
+
+            u16::from_le_bytes([pred_buf[0], pred_buf[1]]) as u64
+        }
+
+        let nospace_offset = (reader.index() as isize) - self.nospace_start;
+        if nospace_offset < 16 {
+            let bitmap = {
+                let mask = !((1 << nospace_offset) - 1);
+                self.nospace_bits & mask
+            };
+            if bitmap != 0 {
+                let cnt = bitmap.trailing_zeros() as usize;
+                let ch = reader.at(self.nospace_start as usize + cnt);
+                reader.set_index(self.nospace_start as usize + cnt + 1);
+                return Some(ch);
+            } else {
+                reader.set_index(self.nospace_start as usize + 16);
+            }
+        }
+
         while let Some(chunk) = reader.peek_n(16) {
             let chunk = unsafe { &*(chunk.as_ptr() as *const [_; 16]) };
-            let bitmap = unsafe { crate::util::arch::get_nonspace_bits(chunk) };
+            let bitmap = unsafe { get_nonspace_bits(chunk) };
             if bitmap != 0 {
+                self.nospace_bits = bitmap;
+                self.nospace_start = reader.index() as isize;
                 let cnt = bitmap.trailing_zeros() as usize;
                 let ch = chunk[cnt];
                 reader.eat(cnt + 1);
-
                 return Some(ch);
             }
             reader.eat(16)
@@ -301,11 +344,20 @@ impl SpaceSkipper {
 
         while let Some(ch) = reader.next() {
             if !is_whitespace(ch) {
-                //
                 return Some(ch);
             }
         }
         None
+    }
+
+    #[inline(always)]
+    pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
+        unsafe { self.skip_space_sve2(reader) }
+    }
+
+    #[inline(always)]
+    pub fn skip_all_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) {
+        while self.skip_space(reader).is_some() {}
     }
 }
 
