@@ -194,10 +194,10 @@ fn bench_space_skipper(c: &mut Criterion) {
     let mut group = c.benchmark_group("SpaceSkipper_RealData");
     
     // 设置读取目录 (根据你的项目根目录结构调整)
-    let testdata_dir = "benchmarks/benches/testdata";
+    let testdata_dir = std::env::var("TESTDIR").unwrap();
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
-    match std::fs::read_dir(testdata_dir) {
+    match std::fs::read_dir(&testdata_dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -215,7 +215,7 @@ fn bench_space_skipper(c: &mut Criterion) {
     }
 
     if files.is_empty() {
-        eprintln!("⚠️ Warning: No .json files found in '{}'.", testdata_dir);
+        eprintln!("⚠️ Warning: No .json files found in '{}'.", &testdata_dir);
         return;
     }
 
