@@ -4,12 +4,32 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use sonic_rs::{Read, prelude::Reader};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 
 #[inline(always)]
 fn is_whitespace(ch: u8) -> bool {
     const SPACE_MASK: u64 = (1u64 << b' ') | (1u64 << b'\r') | (1u64 << b'\n') | (1u64 << b'\t');
     1u64.checked_shl(ch as u32)
         .is_some_and(|v| v & SPACE_MASK != 0)
+}
+
+// ==========================================
+// 辅助函数：生成随机 Payload
+// ==========================================
+fn generate_random_payload(len: usize, space_ratio: f64, seed: u64) -> Vec<u8> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let spaces = b" \n\r\t";
+    let non_spaces = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+    (0..len)
+        .map(|_| {
+            if rng.random_bool(space_ratio) {
+                spaces[rng.random_range(0..spaces.len())]
+            } else {
+                non_spaces[rng.random_range(0..non_spaces.len())]
+            }
+        })
+        .collect()
 }
 
 // ==========================================
@@ -54,7 +74,6 @@ impl NeonSpaceSkipper {
                 vtstq_u8(v, white_mask)
             }
 
-            // 注意：这里需要确保 sonic_simd::neon::to_bitmask64 在 bench 环境下可访问
             !sonic_simd::neon::to_bitmask64(
                 chunk_nonspace_bits(vld1q_u8(data.as_ptr())),
                 chunk_nonspace_bits(vld1q_u8(data.as_ptr().offset(16))),
@@ -176,34 +195,36 @@ impl SveSpaceSkipper {
 // Benchmark 代码
 // ==========================================
 fn bench_space_skipper(c: &mut Criterion) {
-    let mut group = c.benchmark_group("SpaceSkipper");
+    let mut group = c.benchmark_group("SpaceSkipper_Random");
 
-    // 构造不同长度的空白字符用例
-    let payloads: &[(&str, &[u8])] = &[
-        ("Short_Space", b"   \"key\""),
-        ("Medium_Space", b"                                \"key\""), // 32 spaces
-        ("Long_Space", b"                                                                                                    \"key\""), // 100 spaces
-        ("No_Space", b"\"key\""),
-    ];
+    // 定义数据规模和空格比例
+    let sizes = [1024, 10 * 1024]; // 测试 1KB 和 10KB 
+    let space_ratios = [0.1, 0.5, 0.9]; // 10% 空格 (紧凑), 50% 空格 (混合), 90% 空格 (稀疏)
 
-    for (name, payload) in payloads {
-        // NEON Benchmark
-        group.bench_with_input(BenchmarkId::new("NEON", name), payload, |b, p| {
-            b.iter(|| {
-                let mut reader = Read::from(*p);
-                let mut skipper = NeonSpaceSkipper::new();
-                black_box(skipper.skip_all_space(&mut reader))
+    for &size in &sizes {
+        for &ratio in &space_ratios {
+            // 使用固定的 seed 以确保每次 bench 生成的内容完全一致
+            let payload = generate_random_payload(size, ratio, 42);
+            let id = format!("{}B_{}%_spaces", size, (ratio * 100.0) as usize);
+
+            // NEON Benchmark
+            group.bench_with_input(BenchmarkId::new("NEON", &id), &payload, |b, p| {
+                b.iter(|| {
+                    let mut reader = Read::from(p.as_slice());
+                    let mut skipper = NeonSpaceSkipper::new();
+                    black_box(skipper.skip_all_space(&mut reader))
+                });
             });
-        });
 
-        // SVE2 Benchmark
-        group.bench_with_input(BenchmarkId::new("SVE2", name), payload, |b, p| {
-            b.iter(|| {
-                let mut reader = Read::from(*p);
-                let mut skipper = SveSpaceSkipper::new();
-                black_box(skipper.skip_all_space(&mut reader))
+            // SVE2 Benchmark
+            group.bench_with_input(BenchmarkId::new("SVE2", &id), &payload, |b, p| {
+                b.iter(|| {
+                    let mut reader = Read::from(p.as_slice());
+                    let mut skipper = SveSpaceSkipper::new();
+                    black_box(skipper.skip_all_space(&mut reader))
+                });
             });
-        });
+        }
     }
 
     group.finish();
