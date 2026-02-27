@@ -3,8 +3,8 @@
 use std::{fs::read_dir, hint::black_box};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use sonic_rs::{Read, prelude::Reader};
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
+use sonic_rs::{Read, prelude::Reader};
 
 #[inline(always)]
 fn is_whitespace(ch: u8) -> bool {
@@ -190,9 +190,103 @@ impl SveSpaceSkipper {
         while self.skip_space(reader).is_some() {}
     }
 }
+
+struct SveSpaceSkipperWithCache {
+    nospace_bits: u64,
+    nospace_start: isize,
+}
+
+impl SveSpaceSkipperWithCache {
+    pub fn new() -> Self {
+        Self {
+            nospace_bits: 0,
+            nospace_start: -128,
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn skip_space_sve2<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
+        #[inline(always)]
+        unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u64 {
+            // 安全防范：SVE 架构中，Predicate 寄存器最大可达 256-bit (32 bytes)
+            // 必须分配足够大的空间，防止 STR 指令写坏栈内存
+            let mut pred_buf = [0u8; 32];
+            let tokens: u32 = 0x090a0d20;
+
+            core::arch::asm!(
+                "ptrue  p0.b, vl16",
+                "ld1b   {{z0.b}}, p0/z, [{ptr}]",
+                "mov    z1.s, {t:w}",
+                "nmatch p1.b, p0/z, z0.b, z1.b",
+                // 将匹配结果的谓词寄存器 P1 完整转存到栈内存中
+                "str    p1, [{out_ptr}]",
+                ptr = in(reg) data.as_ptr(),
+                t = in(reg) tokens,
+                out_ptr = in(reg) pred_buf.as_mut_ptr(),
+                out("z0") _, out("z1") _,
+                out("p0") _, out("p1") _,
+            );
+
+            // vl16 保证了只有前 16 个 bit 是有效匹配结果
+            // 我们直接读取内存中的前 2 个字节组合成 u16 的 bitmap
+            u16::from_le_bytes([pred_buf[0], pred_buf[1]]) as u64
+        }
+
+        // Fast Path：在 16 字节的缓存窗口内，直接做位运算
+        let nospace_offset = (reader.index() as isize) - self.nospace_start;
+        if nospace_offset < 16 {
+            let bitmap = {
+                let mask = !((1 << nospace_offset) - 1);
+                self.nospace_bits & mask
+            };
+            if bitmap != 0 {
+                let cnt = bitmap.trailing_zeros() as usize;
+                let ch = reader.at(self.nospace_start as usize + cnt);
+                reader.set_index(self.nospace_start as usize + cnt + 1);
+                return Some(ch);
+            } else {
+                reader.set_index(self.nospace_start as usize + 16);
+            }
+        }
+
+        // Slow Path：调用 SVE 计算新的 16 字节 Bitmap 并缓存
+        while let Some(chunk) = reader.peek_n(16) {
+            let chunk = unsafe { &*(chunk.as_ptr() as *const [_; 16]) };
+            let bitmap = unsafe { get_nonspace_bits(chunk) };
+            if bitmap != 0 {
+                self.nospace_bits = bitmap;
+                self.nospace_start = reader.index() as isize;
+                let cnt = bitmap.trailing_zeros() as usize;
+                let ch = chunk[cnt];
+                reader.eat(cnt + 1);
+                return Some(ch);
+            }
+            reader.eat(16)
+        }
+
+        // 兜底标量处理
+        while let Some(ch) = reader.next() {
+            if !is_whitespace(ch) {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
+        unsafe { self.skip_space_sve2(reader) }
+    }
+
+    #[inline(always)]
+    pub fn skip_all_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) {
+        while self.skip_space(reader).is_some() {}
+    }
+}
+
 fn bench_space_skipper(c: &mut Criterion) {
     let mut group = c.benchmark_group("SpaceSkipper_RealData");
-    
+
     // 设置读取目录 (根据你的项目根目录结构调整)
     let testdata_dir = std::env::var("TESTDIR").unwrap();
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -203,13 +297,17 @@ fn bench_space_skipper(c: &mut Criterion) {
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("json") {
                     let file_name = path.file_stem().unwrap().to_string_lossy().to_string();
-                    let content = std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read {:?}", path));
+                    let content = std::fs::read(&path)
+                        .unwrap_or_else(|_| panic!("Failed to read {:?}", path));
                     files.push((file_name, content));
                 }
             }
         }
         Err(e) => {
-            eprintln!("⚠️ Warning: Failed to read directory '{}': {}. Skipping file-based benchmarks.", testdata_dir, e);
+            eprintln!(
+                "⚠️ Warning: Failed to read directory '{}': {}. Skipping file-based benchmarks.",
+                testdata_dir, e
+            );
             return;
         }
     }
@@ -235,6 +333,15 @@ fn bench_space_skipper(c: &mut Criterion) {
             b.iter(|| {
                 let mut reader = Read::from(p.as_slice());
                 let mut skipper = SveSpaceSkipper::new();
+                black_box(skipper.skip_all_space(&mut reader))
+            });
+        });
+
+        // SVE2 - cached
+        group.bench_with_input(BenchmarkId::new("SVE2-bitmask", &name), &payload, |b, p| {
+            b.iter(|| {
+                let mut reader = Read::from(p.as_slice());
+                let mut skipper = SveSpaceSkipperWithCache::new();
                 black_box(skipper.skip_all_space(&mut reader))
             });
         });
