@@ -177,3 +177,16 @@ pub(crate) unsafe fn to_bitmask32(v0: uint8x16_t, v1: uint8x16_t) -> u32 {
 
     vgetq_lane_u32(vreinterpretq_u32_u8(octa), 0)
 }
+
+#[inline(always)]
+pub unsafe fn to_bitmask16(v0: uint8x16_t) -> u16 {
+    let bit_mask = core::mem::transmute::<[u8; 16], uint8x16_t>(BIT_MASK_TAB);
+
+    let t0 = vandq_u8(v0, bit_mask);
+
+    let pair = vpaddq_u8(t0, t0);
+    let quad = vpaddq_u8(pair, pair);
+    let octa = vpaddq_u8(quad, quad);
+
+    vgetq_lane_u16(vreinterpretq_u16_u8(octa), 0)
+}

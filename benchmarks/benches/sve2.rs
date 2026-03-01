@@ -103,6 +103,64 @@ impl NeonSpaceSkipper {
     }
 }
 
+struct NeonSpaceSkipperNoReuse;
+
+impl NeonSpaceSkipperNoReuse {
+    #[inline(always)]
+    pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
+        pub unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u64 {
+            use std::arch::aarch64::*;
+
+            #[inline(always)]
+            unsafe fn chunk_nonspace_bits(input: uint8x16_t) -> uint8x16_t {
+                const LOW_TAB: uint8x16_t = unsafe {
+                    std::mem::transmute([16u8, 0, 0, 0, 0, 0, 0, 0, 0, 8, 12, 1, 2, 9, 0, 0])
+                };
+                const HIGH_TAB: uint8x16_t = unsafe {
+                    std::mem::transmute([8u8, 0, 18, 4, 0, 1, 0, 1, 0, 0, 0, 3, 2, 1, 0, 0])
+                };
+
+                let white_mask = vmovq_n_u8(0x18);
+                let lo4 = vandq_u8(input, vmovq_n_u8(0xf));
+                let hi4 = vshrq_n_u8(input, 4);
+
+                let lo4_sf = vqtbl1q_u8(LOW_TAB, lo4);
+                let hi4_sf = vqtbl1q_u8(HIGH_TAB, hi4);
+
+                let v = vandq_u8(lo4_sf, hi4_sf);
+
+                vtstq_u8(v, white_mask)
+            }
+
+            !sonic_simd::neon::to_bitmask16(chunk_nonspace_bits(vld1q_u8(data.as_ptr()))) as u64
+        }
+
+        while let Some(chunk) = reader.peek_n(16) {
+            let chunk = unsafe { &*(chunk.as_ptr() as *const [_; 16]) };
+            let bitmap = unsafe { get_nonspace_bits(chunk) };
+            if bitmap != 0 {
+                let cnt = bitmap.trailing_zeros() as usize;
+                let ch = chunk[cnt];
+                reader.eat(cnt + 1);
+                return Some(ch);
+            }
+            reader.eat(16)
+        }
+
+        while let Some(ch) = reader.next() {
+            if !is_whitespace(ch) {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn skip_all_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) {
+        while self.skip_space(reader).is_some() {}
+    }
+}
+
 // ==========================================
 // SVE2 版本
 // ==========================================
@@ -415,6 +473,19 @@ fn bench_space_skipper(c: &mut Criterion) {
             });
         });
 
+        // NEON no-reuse-bitmask
+        group.bench_with_input(
+            BenchmarkId::new("NEON-no-reuse", &name),
+            &payload,
+            |b, p| {
+                b.iter(|| {
+                    let mut reader = Read::from(p.as_slice());
+                    let mut skipper = NeonSpaceSkipperNoReuse;
+                    black_box(skipper.skip_all_space(&mut reader))
+                });
+            },
+        );
+
         // SVE2
         group.bench_with_input(BenchmarkId::new("SVE2", &name), &payload, |b, p| {
             b.iter(|| {
@@ -434,13 +505,17 @@ fn bench_space_skipper(c: &mut Criterion) {
         });
 
         // SVE2 - cached with 64bit
-        group.bench_with_input(BenchmarkId::new("SVE2-bitmask64", &name), &payload, |b, p| {
-            b.iter(|| {
-                let mut reader = Read::from(p.as_slice());
-                let mut skipper = SveSpaceSkipper64::new();
-                black_box(skipper.skip_all_space(&mut reader))
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("SVE2-bitmask64", &name),
+            &payload,
+            |b, p| {
+                b.iter(|| {
+                    let mut reader = Read::from(p.as_slice());
+                    let mut skipper = SveSpaceSkipper64::new();
+                    black_box(skipper.skip_all_space(&mut reader))
+                });
+            },
+        );
     }
 
     group.finish();
