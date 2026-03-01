@@ -103,12 +103,13 @@ impl NeonSpaceSkipper {
     }
 }
 
-struct NeonSpaceSkipperNoReuse;
+// space skipper 16 without reusable bitmask
+struct NeonSpaceSkipper16;
 
-impl NeonSpaceSkipperNoReuse {
+impl NeonSpaceSkipper16 {
     #[inline(always)]
     pub fn skip_space<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
-        pub unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u64 {
+        pub unsafe fn get_nonspace_bits(data: &[u8; 16]) -> u16 {
             use std::arch::aarch64::*;
 
             #[inline(always)]
@@ -132,7 +133,24 @@ impl NeonSpaceSkipperNoReuse {
                 vtstq_u8(v, white_mask)
             }
 
-            !sonic_simd::neon::to_bitmask16(chunk_nonspace_bits(vld1q_u8(data.as_ptr()))) as u64
+            #[inline(always)]
+            pub unsafe fn to_bitmask16(v0: uint8x16_t) -> u16 {
+                const BIT_MASK_TAB: [u8; 16] = [
+                    0x01u8, 0x02, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x4, 0x8, 0x10,
+                    0x20, 0x40, 0x80,
+                ];
+                let bit_mask = core::mem::transmute::<[u8; 16], uint8x16_t>(BIT_MASK_TAB);
+
+                let t0 = vandq_u8(v0, bit_mask);
+
+                let pair = vpaddq_u8(t0, t0);
+                let quad = vpaddq_u8(pair, pair);
+                let octa = vpaddq_u8(quad, quad);
+
+                vgetq_lane_u16(vreinterpretq_u16_u8(octa), 0)
+            }
+
+            !to_bitmask16(chunk_nonspace_bits(vld1q_u8(data.as_ptr()))) as u16
         }
 
         while let Some(chunk) = reader.peek_n(16) {
@@ -161,9 +179,6 @@ impl NeonSpaceSkipperNoReuse {
     }
 }
 
-// ==========================================
-// SVE2 版本
-// ==========================================
 struct SveSpaceSkipper;
 
 impl SveSpaceSkipper {
@@ -226,12 +241,12 @@ impl SveSpaceSkipper {
     }
 }
 
-struct SveSpaceSkipperWithCache {
+struct SveSpaceSkipper16 {
     nospace_bits: u64,
     nospace_start: isize,
 }
 
-impl SveSpaceSkipperWithCache {
+impl SveSpaceSkipper16 {
     pub fn new() -> Self {
         Self {
             nospace_bits: 0,
@@ -328,9 +343,6 @@ impl SveSpaceSkipper64 {
     pub unsafe fn skip_space_sve2<'de, R: Reader<'de>>(&mut self, reader: &mut R) -> Option<u8> {
         #[inline(always)]
         unsafe fn get_nonspace_bits_64(data: &[u8; 64]) -> u64 {
-            // SVE 最大支持 2048-bit (256 字节) 向量，其对应的谓词寄存器最大为 32 字节。
-            // 最后一个谓词存储在 +6 字节偏移处，最多可能写入 6 + 32 = 38 字节。
-            // 使用 64 字节缓冲区 ([0u64; 8]) 以绝对确保在任何 SVE 硬件上都不会越界。
             let mut pred_buf = [0u64; 8];
             let tokens: u32 = 0x090a0d20;
 
@@ -338,31 +350,24 @@ impl SveSpaceSkipper64 {
                 "ptrue  p0.b, vl16",
                 "mov    z4.s, {t:w}",
 
-                // 准备精确的加载偏移量
                 "mov    x10, #16",
                 "mov    x11, #32",
                 "mov    x12, #48",
 
-                // 并行加载 4 个 16 字节块
                 "ld1b   {{z0.b}}, p0/z, [{ptr}]",
                 "ld1b   {{z1.b}}, p0/z, [{ptr}, x10]",
                 "ld1b   {{z2.b}}, p0/z, [{ptr}, x11]",
                 "ld1b   {{z3.b}}, p0/z, [{ptr}, x12]",
 
-                // 并行执行 NMATCH (利用 ILP)
                 "nmatch p1.b, p0/z, z0.b, z4.b",
                 "nmatch p2.b, p0/z, z1.b, z4.b",
                 "nmatch p3.b, p0/z, z2.b, z4.b",
                 "nmatch p4.b, p0/z, z3.b, z4.b",
 
-                // 准备谓词存储的内存偏移 (+0, +2, +4, +6)
-                // 谓词存储指令 STR 仅支持立即数乘以 VL 的偏移，不支持寄存器偏移
-                // 因此我们直接预先计算好目标标量地址
                 "add    x10, {out_ptr}, #2",
                 "add    x11, {out_ptr}, #4",
                 "add    x12, {out_ptr}, #6",
 
-                // 利用重叠写入拼装 64-bit 掩码
                 "str    p1, [{out_ptr}]",
                 "str    p2, [x10]",
                 "str    p3, [x11]",
@@ -372,13 +377,11 @@ impl SveSpaceSkipper64 {
                 t = in(reg) tokens,
                 out_ptr = in(reg) pred_buf.as_mut_ptr(),
 
-                // 声明使用的所有寄存器以防止冲突
                 out("z0") _, out("z1") _, out("z2") _, out("z3") _, out("z4") _,
                 out("p0") _, out("p1") _, out("p2") _, out("p3") _, out("p4") _,
                 out("x10") _, out("x11") _, out("x12") _
             );
 
-            // 直接取缓冲区的第一个 u64 即可，里面完美按照 chunk 顺序包含了 64 个有效位
             pred_buf[0]
         }
 
@@ -480,7 +483,7 @@ fn bench_space_skipper(c: &mut Criterion) {
             |b, p| {
                 b.iter(|| {
                     let mut reader = Read::from(p.as_slice());
-                    let mut skipper = NeonSpaceSkipperNoReuse;
+                    let mut skipper = NeonSpaceSkipper16;
                     black_box(skipper.skip_all_space(&mut reader))
                 });
             },
@@ -496,10 +499,10 @@ fn bench_space_skipper(c: &mut Criterion) {
         });
 
         // SVE2 - cached
-        group.bench_with_input(BenchmarkId::new("SVE2-bitmask", &name), &payload, |b, p| {
+        group.bench_with_input(BenchmarkId::new("SVE2-bitmask16", &name), &payload, |b, p| {
             b.iter(|| {
                 let mut reader = Read::from(p.as_slice());
-                let mut skipper = SveSpaceSkipperWithCache::new();
+                let mut skipper = SveSpaceSkipper16::new();
                 black_box(skipper.skip_all_space(&mut reader))
             });
         });
