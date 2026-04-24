@@ -173,12 +173,10 @@ pub(crate) unsafe fn parse_string_inplace(
             let v = unsafe { load(*src) };
             let block = StringBlock::new(&v);
             if block.has_quote_first() {
-                while **src != b'"' {
-                    *dst = **src;
-                    dst = dst.add(1);
-                    *src = src.add(1);
-                }
-                *src = src.add(1); // skip ending quote
+                let idx = block.quote_index();
+                std::ptr::copy_nonoverlapping(*src, dst, idx);
+                *src = src.add(idx + 1); // skip ending quote
+                dst = dst.add(idx);
                 return Ok(dst.offset_from(sdst) as usize);
             }
             if block.has_unescaped() {
@@ -191,12 +189,10 @@ pub(crate) unsafe fn parse_string_inplace(
                 dst = dst.add(StringBlock::LANES);
                 continue 'find_and_move;
             }
-            // TODO: loop unrooling here
-            while **src != b'\\' {
-                *dst = **src;
-                dst = dst.add(1);
-                *src = src.add(1);
-            }
+            let idx = block.bs_index();
+            std::ptr::copy_nonoverlapping(*src, dst, idx);
+            *src = src.add(idx);
+            dst = dst.add(idx);
             break 'find_and_move;
         }
     } // slow loop for escaped chars
